@@ -9715,7 +9715,8 @@ class Scheduler:
             # Filter before ranking so an ineligible larger store cannot
             # hide a smaller one whose prefix can actually be reused.
             restorable = (common // block) * block
-            if restorable == len(prompt):
+            exact_hit = restorable == len(prompt)
+            if exact_hit:
                 # Match exact-hit generation kickoff in prefix preparation:
                 # GDN sidecars drop the final block; other stateful caches
                 # cannot trim to N-1 and require a full prefill.
@@ -9723,7 +9724,25 @@ class Scheduler:
                     restorable = max(0, restorable - block)
                 elif self._detect_boundary_snapshot_need():
                     restorable = 0
-            if restorable < block:
+            # Stateful non-sliceable models (ArraysCache/GDN, RotatingKV)
+            # persist a store's truncated sequence as a tail-terminal block and
+            # the lookup matches it through the tail index even when it is
+            # shorter than one block. A prompt the store fully covers is
+            # therefore restorable from that tail. Without this the wait never
+            # fires for sub-block prompts, so the repeat looks up before the
+            # tail is registered and re-prefills from scratch (the
+            # <block_size cliff). An exact full-block hit keeps its own rule
+            # above: it cannot trim to N-1, so a tail does not apply.
+            tail_reusable = (
+                not exact_hit
+                and common > 0
+                and restorable < common
+                and common == len(info.tokens)
+                and self._detect_boundary_snapshot_need()
+            )
+            if tail_reusable:
+                restorable = common
+            if restorable < block and not tail_reusable:
                 continue
             if (
                 len(info.tokens)
