@@ -9724,15 +9724,8 @@ class Scheduler:
                     restorable = max(0, restorable - block)
                 elif self._detect_boundary_snapshot_need():
                     restorable = 0
-            # Stateful non-sliceable models (ArraysCache/GDN, RotatingKV)
-            # persist a store's truncated sequence as a tail-terminal block and
-            # the lookup matches it through the tail index even when it is
-            # shorter than one block. A prompt the store fully covers is
-            # therefore restorable from that tail. Without this the wait never
-            # fires for sub-block prompts, so the repeat looks up before the
-            # tail is registered and re-prefills from scratch (the
-            # <block_size cliff). An exact full-block hit keeps its own rule
-            # above: it cannot trim to N-1, so a tail does not apply.
+            # A stateful store's tail-terminal block matches below one block, so
+            # a prompt the store fully covers is restorable from it.
             tail_reusable = (
                 not exact_hit
                 and common > 0
