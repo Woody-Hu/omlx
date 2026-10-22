@@ -4763,8 +4763,10 @@ class Scheduler:
             # gathered sample. The rate is also bucketed by chunk size: a
             # per-token rate read off a small or throttled chunk is dominated
             # by a near size-invariant per-chunk cost, so it is only reused
-            # for a comparable chunk, and an unobserved size class falls back
-            # to the static profile instead of extrapolating (#4057).
+            # for a chunk of a comparable size (#4057). A smaller chunk borrows
+            # the nearest larger measurement, because it costs at least as much
+            # per token; only when nothing larger was observed does the static
+            # profile stand alone.
             recent_reclaim = tracker.recent_reclaim_bytes
             measured_rate = tracker.bytes_per_token_for_size(n_tokens, gathered_core)
             if measured_rate > 0:

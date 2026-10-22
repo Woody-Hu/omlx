@@ -396,6 +396,29 @@ class TestSizeBucketedRate:
         assert t.bytes_per_token_for_size(4096, False) == 9000
         assert t.bytes_per_token_for_size(8192, False) == 0.0
 
+    def test_smaller_chunk_borrows_a_larger_class_rate(self):
+        """Only 2048-token chunks measured: the throttle walking down to
+        1024/512/256 must keep pricing them from that rate. A smaller chunk
+        costs at least as much per token, so falling back to static alone
+        under-predicts and lets a chunk main used to split slip near the cap.
+        """
+        t = PrefillTransientTracker()
+        for _ in range(4):
+            t.update(2048, 2048 * 1024 * 1024)
+        step_rate = t.bytes_per_token_for_size(2048, False)
+        assert step_rate > 0
+        for smaller in (1024, 512, 256, 32):
+            assert t.bytes_per_token_for_size(smaller, False) == step_rate
+
+    def test_static_fallback_only_when_nothing_larger_was_observed(self):
+        t = PrefillTransientTracker()
+        t.update(256, 256 * 1000)
+        # Nothing above the queried class: the caller keeps its static bound.
+        assert t.bytes_per_token_for_size(4096, False) == 0.0
+        t.update(8192, 8192 * 500)
+        # A larger observation is a valid lower bound for 4096.
+        assert t.bytes_per_token_for_size(4096, False) == 500
+
     def test_outlier_tail_within_a_class_is_still_rejected(self):
         t = PrefillTransientTracker()
         t.update(2048, 2048 * 1000)

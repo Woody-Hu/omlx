@@ -138,12 +138,12 @@ def _throttle_ctx(
     reclaim drops `current` to."""
     tracker = PrefillTransientTracker()
     if samples_bpt is not None:
-        # Seed one observation per chunk-size class: sets last_delta/last_n
-        # AND the EWMA for the sub-floor, throttled-probe, and step-range
-        # classes. The predictor is size-bucketed (#4057), so a single seed
-        # is only visible to a query of the same size class.
-        for n in (1, 512, 2048):
-            tracker.update(n, int(samples_bpt * n))
+        # Seed one step-range observation: sets last_delta/last_n AND the
+        # EWMA for the 1024-4096 class. The predictor is size-bucketed
+        # (#4057), and a smaller chunk borrows that rate because it costs at
+        # least as much per token, so shrinking below the step range stays
+        # priced while a larger chunk still falls back to static.
+        tracker.update(2048, int(samples_bpt * 2048))
     ns = SimpleNamespace(
         _memory_limit_bytes=int(hard * 0.85),  # soft = ceiling*0.85
         _memory_hard_limit_bytes=int(hard),
@@ -661,6 +661,31 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
         + tracker.flat_overhead_charge_for(True)
     )
     assert predicted < 20 * _GB / measured_tokens * candidate
+
+
+def test_throttled_down_chunk_borrows_the_step_range_rate():
+    """Review on #4681: with only 2048-token chunks measured, the throttle
+    walking down to 1024/512/256 must keep pricing them from that rate. A
+    smaller chunk costs at least as much per token, so static alone
+    under-predicts and a chunk main used to split could be submitted near
+    the cap."""
+    monitor = _monitor(head_dim=192)
+    tracker = PrefillTransientTracker()
+    step_rate = 2 * 1024**2
+    for _ in range(4):
+        tracker.update(2048, int(step_rate * 2048))
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    for smaller in (1024, 512, 256, 32):
+        static = monitor.estimate_chunk_transient_bytes(smaller, smaller)
+        static += monitor.estimate_prompt_kv_bytes(smaller)
+        predicted = ns._predicted_chunk_transient(smaller, 0)
+        assert predicted == pytest.approx(
+            step_rate * smaller * Scheduler._PREFILL_TRANSIENT_SAFETY,
+            rel=1e-6,
+        )
+        assert predicted > static
 
 
 def test_small_chunk_rate_is_not_extrapolated_to_a_large_chunk():

@@ -300,17 +300,32 @@ class PrefillTransientTracker:
     def bytes_per_token_for_size(self, n_tokens: int, gathered_core: bool) -> float:
         """Size-bucketed per-token transient rate for a chunk of ``n_tokens``.
 
-        Returns 0.0 when this size class has no observation yet, so the
-        caller falls back to its static estimator instead of extrapolating a
-        smaller chunk's rate (#4057). The latest raw delta of the same size
-        class is adopted only while it stays inside ``_EWMA_OUTLIER_RATIO`` of
-        the bucket EWMA — the protection the EWMA blend applies, which the
-        size-blind ``last_delta/last_n`` term used to bypass.
+        A chunk costs at least as many bytes per token as a larger one: the
+        near size-invariant per-chunk cost amortizes over fewer tokens. An
+        unobserved size class therefore borrows the rate of the smallest
+        observed class above it, the tightest lower bound available, so a
+        chunk the throttle shrinks to still gets priced from measurement
+        instead of the static profile alone. Extrapolating a smaller chunk's
+        rate upward stays forbidden (#4057); the static fallback only applies
+        when nothing larger has been observed.
+
+        The latest raw delta of a measured class is adopted only while it
+        stays inside ``_EWMA_OUTLIER_RATIO`` of that class's EWMA — the
+        protection the EWMA blend applies, which the size-blind
+        ``last_delta/last_n`` term used to bypass.
         """
         if n_tokens <= 0:
             return 0.0
         history = self._history(gathered_core)
         bucket = _size_bucket_index(n_tokens)
+        for candidate in range(bucket, len(_SIZE_BUCKET_BOUNDS) + 1):
+            rate = self._bucket_rate(history, candidate)
+            if rate > 0.0:
+                return rate
+        return 0.0
+
+    def _bucket_rate(self, history: _TransientHistory, bucket: int) -> float:
+        """Return the rate measured for one size class, or 0.0 if unobserved."""
         rate = history.bucket_ewma_per_token.get(bucket, 0.0)
         last_n = history.bucket_last_n_tokens.get(bucket, 0)
         last_delta = history.bucket_last_delta_bytes.get(bucket, 0)
