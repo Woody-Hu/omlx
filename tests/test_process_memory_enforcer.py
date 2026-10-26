@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import io
+import time
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -644,6 +645,61 @@ class TestCurrentUsageTelemetry:
             ),
         ):
             assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
+
+    def test_metal_cap_resamples_a_sysctl_raised_at_runtime(self, mock_engine_pool):
+        """#4849: raising iogpu.wired_limit_mb must not need a server restart."""
+        enforcer = _make_enforcer(mock_engine_pool)
+        enforcer._effective_metal_cap_bytes = 8 * 1024**3
+        enforcer._metal_cap_resampled_at = 0.0
+
+        with patch.object(pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3):
+            enforcer._resample_metal_cap_if_due()
+
+        assert enforcer._effective_metal_cap_bytes == 12 * 1024**3
+
+    def test_metal_cap_resample_is_rate_limited(self, mock_engine_pool):
+        """The resample shells out to sysctl, so it must not run on every tick."""
+        enforcer = _make_enforcer(mock_engine_pool)
+        enforcer._effective_metal_cap_bytes = 8 * 1024**3
+        enforcer._metal_cap_resampled_at = time.monotonic()
+
+        with patch.object(
+            pme, "get_effective_metal_cap_bytes", return_value=12 * 1024**3
+        ) as reader:
+            enforcer._resample_metal_cap_if_due()
+
+        reader.assert_not_called()
+        assert enforcer._effective_metal_cap_bytes == 8 * 1024**3
+
+    @pytest.mark.asyncio
+    async def test_runtime_metal_cap_raise_reaches_the_scheduler(
+        self, mock_engine_pool
+    ):
+        """The poll loop propagates a freshly sampled cap in the same tick."""
+        new_cap = 12 * 1024**3
+        enforcer = _make_enforcer(mock_engine_pool, ceiling=new_cap)
+        enforcer._prefill_memory_guard = True
+        enforcer._effective_metal_cap_bytes = 8 * 1024**3
+        enforcer._metal_cap_resampled_at = 0.0
+        # Mirror production: the breakdown's metal_cap term is whichever cap is
+        # *cached*, so the test only passes if the poll loop re-sampled first.
+        enforcer._get_ceiling_breakdown = lambda: {
+            "static": new_cap,
+            "dynamic": new_cap,
+            "metal_cap": enforcer._get_effective_metal_cap_bytes(),
+            "hard_limit": new_cap,
+        }
+
+        scheduler = MagicMock(spec=[])
+        scheduler._memory_metal_cap_bytes = 0
+        engine = MagicMock(spec=[])
+        engine.scheduler = scheduler
+        mock_engine_pool._entries = {"model-a": _make_entry("model-a", engine=engine)}
+
+        with patch.object(pme, "get_effective_metal_cap_bytes", return_value=new_cap):
+            await enforcer._check_and_enforce()
+
+        assert scheduler._memory_metal_cap_bytes == new_cap
 
 
 class TestDisabledWhenCeilingZero:

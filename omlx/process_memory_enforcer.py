@@ -147,6 +147,11 @@ def _spend(ledger: deque[list[float]], amount: float) -> float:
     return amount
 
 
+# A raised iogpu.wired_limit_mb must not need a restart (#4849). The read
+# shells out to sysctl, so sample on this cadence rather than every tick.
+_METAL_CAP_RESAMPLE_INTERVAL_S = 60.0
+
+
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
     return f"{b / 1024**3:.1f}GB"
@@ -497,6 +502,8 @@ class ProcessMemoryEnforcer:
         self._release_credits: deque[list[float]] = deque()
         # [expires_at, bytes] of free-memory rises seen before their release.
         self._early_free_rises: deque[list[float]] = deque()
+        # When the cap was last re-sampled from the kernel sysctl (#4849).
+        self._metal_cap_resampled_at: float = 0.0
         # Engine types we've already complained about in
         # ``_propagate_memory_limit``'s "scheduler unreachable" path.
         # Prevents the per-poll warning from spamming logs while keeping
@@ -1056,6 +1063,21 @@ class ProcessMemoryEnforcer:
         if self._effective_metal_cap_bytes is None:
             return self._refresh_effective_metal_cap_bytes()
         return self._effective_metal_cap_bytes
+
+    def _resample_metal_cap_if_due(self) -> None:
+        """Re-sample the cached Metal cap so a runtime sysctl raise lands (#4849)."""
+        now = time.monotonic()
+        if now - self._metal_cap_resampled_at < _METAL_CAP_RESAMPLE_INTERVAL_S:
+            return
+        self._metal_cap_resampled_at = now
+        previous = self._effective_metal_cap_bytes
+        current = self._refresh_effective_metal_cap_bytes()
+        if previous and current and current != previous:
+            logger.info(
+                "Memory guard: kernel Metal cap changed at runtime, %s -> %s",
+                _format_gb(previous),
+                _format_gb(current),
+            )
 
     def _has_active_requests(self) -> bool:
         """Best-effort active-request detection without touching MLX."""
@@ -1729,6 +1751,10 @@ class ProcessMemoryEnforcer:
         """
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
+        if self._prefill_memory_guard:
+            # Sample before propagating so a raised cap reaches the scheduler
+            # in this same tick.
+            self._resample_metal_cap_if_due()
         self._propagate_memory_limit()
 
         ceiling = self._get_hard_limit_bytes()
