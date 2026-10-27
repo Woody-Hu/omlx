@@ -147,8 +147,7 @@ def _spend(ledger: deque[list[float]], amount: float) -> float:
     return amount
 
 
-# A raised iogpu.wired_limit_mb must not need a restart (#4849). The read
-# shells out to sysctl, so sample on this cadence rather than every tick.
+# Re-reading the Metal cap shells out to sysctl, so do it at most this often.
 _METAL_CAP_RESAMPLE_INTERVAL_S = 60.0
 
 
@@ -492,9 +491,8 @@ class ProcessMemoryEnforcer:
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
         self._metal_wired_limit_request: int = 0
-        # Cached Metal cap used by the background poll loop. Reading the Apple
-        # default cap falls back to mx.device_info(), so keep it out of active
-        # decode ticks once the enforcer is running.
+        # Cached Metal cap. The poll loop re-reads it at most every
+        # _METAL_CAP_RESAMPLE_INTERVAL_S.
         self._effective_metal_cap_bytes: int | None = None
         # Last (time, oMLX usage, free + inactive) a dynamic ceiling read saw.
         self._last_release_sample: tuple[float, int, int] | None = None
@@ -502,7 +500,7 @@ class ProcessMemoryEnforcer:
         self._release_credits: deque[list[float]] = deque()
         # [expires_at, bytes] of free-memory rises seen before their release.
         self._early_free_rises: deque[list[float]] = deque()
-        # When the cap was last re-sampled from the kernel sysctl (#4849).
+        # Monotonic time of the last poll-loop re-read of the Metal cap.
         self._metal_cap_resampled_at: float = 0.0
         # Engine types we've already complained about in
         # ``_propagate_memory_limit``'s "scheduler unreachable" path.
@@ -1054,7 +1052,7 @@ class ProcessMemoryEnforcer:
         return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
 
     def _refresh_effective_metal_cap_bytes(self) -> int:
-        """Refresh the cached effective Metal cap outside the poll hot path."""
+        """Re-read the effective Metal cap into the cache."""
         self._effective_metal_cap_bytes = get_effective_metal_cap_bytes()
         return self._effective_metal_cap_bytes
 
@@ -1752,8 +1750,7 @@ class ProcessMemoryEnforcer:
         # Always propagate so the scheduler sees the latest ceiling /
         # admission_paused, even when usage stays below the soft mark.
         if self._prefill_memory_guard:
-            # Sample before propagating so a raised cap reaches the scheduler
-            # in this same tick.
+            # Re-read first so a changed cap reaches the schedulers in this tick.
             self._resample_metal_cap_if_due()
         self._propagate_memory_limit()
 
