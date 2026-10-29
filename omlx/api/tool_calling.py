@@ -754,6 +754,9 @@ def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
 
 
 _ATTR_FUNCTION_OPEN_RE = re.compile(r'<function\s+name="([^"]+)"\s*>')
+# MiniMax dialect without the <minimax:tool_call> wrapper (#4933).
+_BARE_INVOKE_OPEN_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>')
+_BARE_INVOKE_CLOSE = "</invoke>"
 # Both <param> (MiniCPM5's chat template) and <parameter> spellings occur in
 # the wild; the backreference pairs open/close spellings so a literal
 # "</param>" cannot close a <parameter> element. The non-greedy CDATA
@@ -776,18 +779,22 @@ def _iter_attr_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
         yield match.group(2), value
 
 
-def _find_attr_function_span(
+def _find_attr_element_span(
     text: str,
     open_match: Any,
-) -> Optional[Tuple[int, int, str]]:
-    """Locate the true end of a <function name="..."> element.
+    close_tag: str,
+    next_open_re: Any,
+) -> tuple[int, int, str] | None:
+    """Locate the true end of an attribute-style XML element.
 
     Returns (span_start, span_end, payload) or None if unclosed or malformed.
-    A literal '</function>' or '<function' inside a '<![CDATA[...]]>' block
-    does NOT terminate or split the element.
-    An unclosed '<function' tag followed by another '<function' open tag
-    outside CDATA causes this candidate to be rejected so the following
-    real call is not swallowed.
+    A literal close tag or next open tag inside a '<![CDATA[...]]>' block does
+    NOT terminate or split the element. An unclosed open tag followed by
+    another open tag outside CDATA causes this candidate to be rejected so the
+    following real call is not swallowed.
+
+    Shared by the bare <function name="..."> (#3429) and bare
+    <invoke name="..."> (#4933) fallbacks.
     """
     span_start = open_match.start()
     payload_start = open_match.end()
@@ -796,22 +803,22 @@ def _find_attr_function_span(
 
     while cursor < n:
         cdata_start = text.find("<![CDATA[", cursor)
-        close_tag = text.find("</function>", cursor)
-        next_open = _ATTR_FUNCTION_OPEN_RE.search(text, cursor)
+        close_at = text.find(close_tag, cursor)
+        next_open = next_open_re.search(text, cursor)
 
-        if close_tag < 0:
+        if close_at < 0:
             return None
 
         if (
             next_open is not None
             and (cdata_start < 0 or next_open.start() < cdata_start)
-            and next_open.start() < close_tag
+            and next_open.start() < close_at
         ):
-            # Another <function name="..."> begins outside CDATA before </function>:
+            # Another element opens outside CDATA before the close tag:
             # this candidate was unclosed.
             return None
 
-        if cdata_start >= 0 and cdata_start < close_tag:
+        if cdata_start >= 0 and cdata_start < close_at:
             # CDATA block precedes the close tag. Skip past CDATA.
             cdata_end = text.find("]]>", cdata_start + len("<![CDATA["))
             if cdata_end < 0:
@@ -821,11 +828,21 @@ def _find_attr_function_span(
             continue
 
         # close_tag is outside CDATA!
-        span_end = close_tag + len("</function>")
-        payload = text[payload_start:close_tag]
+        span_end = close_at + len(close_tag)
+        payload = text[payload_start:close_at]
         return span_start, span_end, payload
 
     return None
+
+
+def _find_attr_function_span(
+    text: str,
+    open_match: Any,
+) -> Optional[Tuple[int, int, str]]:
+    """Locate the true end of a <function name="..."> element."""
+    return _find_attr_element_span(
+        text, open_match, "</function>", _ATTR_FUNCTION_OPEN_RE
+    )
 
 
 def _find_marker_span_end(
@@ -1153,6 +1170,74 @@ def _parse_attribute_function_tool_calls(
         return text, None
 
     out: List[str] = []
+    last = 0
+    for span_start, span_end in spans:
+        out.append(text[last:span_start])
+        last = span_end
+    out.append(text[last:])
+    return "".join(out).strip(), tool_calls
+
+
+def _parse_bare_invoke_tool_calls(
+    text: str, tools: list | None = None
+) -> tuple[str, list[ToolCall] | None]:
+    """Fallback parser for bare ``<invoke name="...">`` calls (#4933).
+
+    MiMo-V2.6-Flash occasionally writes the MiniMax dialect without the
+    ``<minimax:tool_call>`` wrapper, so the envelope-anchored parser never
+    sees it and the markup is returned to the client as ordinary content.
+
+    Like the bare ``<function name="...">`` fallback (#3429) the only safe
+    anchor is the request's own declarations: an element is parsed only when
+    its name matches a declared tool, and the parser is inert when the
+    request declares no tools. Wrapped calls never reach here because the
+    namespaced branch returns first.
+
+    Returns:
+        Tuple of (cleaned_text, tool_calls or None)
+    """
+    if not tools:
+        return text, None
+    registered = _extract_tool_names(tools)
+    if not registered:
+        return text, None
+
+    tool_calls = []
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    while pos < len(text):
+        match = _BARE_INVOKE_OPEN_RE.search(text, pos)
+        if not match:
+            break
+        func_name = match.group(1)
+        if func_name not in registered:
+            pos = match.end()
+            continue
+
+        span = _find_attr_element_span(
+            text, match, _BARE_INVOKE_CLOSE, _BARE_INVOKE_OPEN_RE
+        )
+        if span is None:
+            pos = match.end()
+            continue
+
+        span_start, span_end, payload = span
+        props = _tool_param_properties(func_name, tools)
+        arguments = {}
+        for key, val in _iter_attr_xml_parameters(payload):
+            arguments[key] = _coerce_param_value(val, key, props, func_name)
+        _built = _build_tool_call(func_name, arguments)
+        if _built is not None:
+            tool_calls.append(_built)
+            spans.append((span_start, span_end))
+            pos = span_end
+        else:
+            pos = match.end()
+
+    if not tool_calls:
+        return text, None
+
+    out: list[str] = []
     last = 0
     for span_start, span_end in spans:
         out.append(text[last:span_start])
@@ -2249,6 +2334,14 @@ def _parse_tool_calls_impl(
         if attr_result[1] is not None:
             return attr_result
 
+    # Fallback: bare <invoke name="..."> elements with no wrapper marker
+    # (#4933). Anchored on declared tool names the same way; see the
+    # parser's docstring.
+    if _BARE_INVOKE_OPEN_RE.search(cleaned_text):
+        invoke_result = _parse_bare_invoke_tool_calls(cleaned_text, tools)
+        if invoke_result[1] is not None:
+            return invoke_result
+
     # Fallback: Hermes-style tool calls (<|tool_call_start|>[func(args)]<|tool_call_end|>)
     if "<|tool_call_start|>" in cleaned_text:
         hermes_result = _parse_hermes_tool_calls(cleaned_text)
@@ -2520,6 +2613,19 @@ def extract_tool_calls_with_thinking(
                     tool_calls_from_thinking = False
             else:
                 valid_names = _extract_tool_names(tools)
+                dropped = [
+                    tc for tc in tool_calls if tc.function.name not in valid_names
+                ]
+                if dropped:
+                    # The stream filter already removed these envelopes from
+                    # reasoning_content, so nothing returns them to the client.
+                    logger.warning(
+                        "Dropped %d tool call(s) from the reasoning channel "
+                        "whose name(s) %s are not declared in this request; "
+                        "their markup is not returned to the client (#4933).",
+                        len(dropped),
+                        sorted({tc.function.name for tc in dropped}),
+                    )
                 tool_calls = [
                     tc for tc in tool_calls if tc.function.name in valid_names
                 ]
@@ -3186,6 +3292,18 @@ class ToolCallStreamFilter:
         if hit is not None:
             starts.append(hit)
 
+        def compute_bare_invoke() -> tuple[int, int, str | None] | None:
+            if not self._registered_tool_names:
+                return None
+            for m in _BARE_INVOKE_OPEN_RE.finditer(text, start):
+                if m.group(1) in self._registered_tool_names:
+                    return (m.start(), len(m.group(0)), _BARE_INVOKE_CLOSE)
+            return None
+
+        hit = lookup("bare_invoke", compute_bare_invoke)
+        if hit is not None:
+            starts.append(hit)
+
         if not starts:
             return None
         return min(starts, key=lambda x: x[0])
@@ -3239,7 +3357,36 @@ class ToolCallStreamFilter:
         rest = rest.lstrip()
         if not rest:
             return True
-        for prefix in ("n", "na", "nam", "name", 'name='):
+        for prefix in ("n", "na", "nam", "name", "name="):
+            if rest == prefix:
+                return True
+        if rest.startswith('name="'):
+            after_quote = rest[len('name="') :]
+            if '"' not in after_quote:
+                return any(
+                    t.startswith(after_quote) for t in self._registered_tool_names
+                )
+            tool_name, after_closing_quote = after_quote.split('"', 1)
+            if tool_name not in self._registered_tool_names:
+                return False
+            return after_closing_quote.isspace() or after_closing_quote == ""
+        return False
+
+    def _could_be_partial_bare_invoke_open(self, candidate: str) -> bool:
+        """Whether candidate could prefix a bare <invoke name="..."> tag for a declared tool."""
+        if not self._registered_tool_names:
+            return False
+        if not candidate.startswith("<invoke") or ">" in candidate:
+            return False
+        rest = candidate[len("<invoke") :]
+        if not rest:
+            return True
+        if not rest[0].isspace():
+            return False
+        rest = rest.lstrip()
+        if not rest:
+            return True
+        for prefix in ("n", "na", "nam", "name", "name="):
             if rest == prefix:
                 return True
         if rest.startswith('name="'):
@@ -3264,9 +3411,11 @@ class ToolCallStreamFilter:
         last_lt = text.rfind("<")
         if last_lt >= 0:
             candidate = text[last_lt:]
-            if self._could_be_partial_namespaced_open(
-                candidate
-            ) or self._could_be_partial_attr_function_open(candidate):
+            if (
+                self._could_be_partial_namespaced_open(candidate)
+                or self._could_be_partial_attr_function_open(candidate)
+                or self._could_be_partial_bare_invoke_open(candidate)
+            ):
                 # Open tags grow with the tool or namespace name, so widen the
                 # window to keep a long tag whole until it closes.
                 longest = max((len(n) for n in self._registered_tool_names), default=0)
@@ -3337,6 +3486,9 @@ class ToolCallStreamFilter:
                 return True
 
         if self._could_be_partial_attr_function_open(tail):
+            return True
+
+        if self._could_be_partial_bare_invoke_open(tail):
             return True
 
         if not tail.startswith("<"):

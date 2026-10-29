@@ -5983,3 +5983,171 @@ def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
     cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
     assert calls is None
     assert cleaned == expected
+
+
+class TestBareInvokeDialect:
+    """Bare ``<invoke name="...">`` calls with no wrapper (#4933).
+
+    MiMo-V2.6-Flash sometimes writes the MiniMax dialect without the
+    ``<minimax:tool_call>`` wrapper, so every envelope-anchored parser misses
+    it and the markup is returned to the client as content. Parsing is
+    anchored on the request's declarations, like the bare
+    ``<function name="...">`` fallback (#3429).
+    """
+
+    SHELL_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }
+
+    BARE_CALL = (
+        '<invoke name="shell">\n'
+        '<parameter name="command">ls -la</parameter>\n'
+        "</invoke>"
+    )
+
+    def _tokenizer(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = False
+        return tok
+
+    def test_bare_invoke_parses_with_declared_tool(self):
+        cleaned, calls = parse_tool_calls(
+            self.BARE_CALL, self._tokenizer(), [self.SHELL_TOOL]
+        )
+        assert cleaned == ""
+        assert calls is not None and len(calls) == 1
+        assert calls[0].function.name == "shell"
+        assert json.loads(calls[0].function.arguments) == {"command": "ls -la"}
+
+    def test_bare_invoke_keeps_surrounding_prose(self):
+        text = f"Listing the folder.\n{self.BARE_CALL}\nDone."
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert calls is not None
+        assert "invoke" not in cleaned
+        assert "Listing the folder." in cleaned
+        assert "Done." in cleaned
+
+    def test_param_short_spelling(self):
+        text = '<invoke name="shell"><param name="command">ls</param></invoke>'
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert json.loads(calls[0].function.arguments) == {"command": "ls"}
+
+    def test_undeclared_name_is_left_untouched(self):
+        text = '<invoke name="delete_file"><parameter name="path">/x</parameter></invoke>'
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert calls is None
+        assert cleaned == text
+
+    def test_parser_inert_without_tools(self):
+        for tools in (None, []):
+            cleaned, calls = parse_tool_calls(
+                self.BARE_CALL, self._tokenizer(), tools
+            )
+            assert calls is None
+            assert cleaned == self.BARE_CALL
+
+    def test_multiple_bare_calls(self):
+        text = (
+            '<invoke name="shell"><parameter name="command">ls</parameter></invoke>\n'
+            '<invoke name="shell"><parameter name="command">pwd</parameter></invoke>'
+        )
+        _, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert [json.loads(c.function.arguments)["command"] for c in calls] == [
+            "ls",
+            "pwd",
+        ]
+
+    def test_wrapped_invoke_still_uses_namespaced_path(self):
+        # The wrapper branch returns first, so an outer <minimax:tool_call>
+        # must never be decomposed into bare <invoke> fragments.
+        text = f"<minimax:tool_call>{self.BARE_CALL}</minimax:tool_call>"
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert cleaned == ""
+        assert len(calls) == 1
+        assert calls[0].function.name == "shell"
+
+    def test_unclosed_bare_invoke_does_not_swallow_next_call(self):
+        text = (
+            'Example: <invoke name="shell"> not closed. '
+            f'Real call: {self.BARE_CALL}'
+        )
+        cleaned, calls = parse_tool_calls(text, self._tokenizer(), [self.SHELL_TOOL])
+        assert calls is not None and len(calls) == 1
+        assert 'Example: <invoke name="shell"> not closed.' in cleaned
+
+    def test_stream_filter_suppresses_bare_invoke_across_chunks(self):
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.SHELL_TOOL])
+        chunks = [
+            "Listing. ",
+            "<inv",
+            'oke name="shell"><parame',
+            'ter name="command">ls -la</parameter>',
+            "</invoke>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Listing.  Done."
+
+    def test_stream_filter_preserves_undeclared_invoke_in_prose(self):
+        f = ToolCallStreamFilter(_make_tokenizer(), tools=[self.SHELL_TOOL])
+        text = (
+            'Docs: <invoke name="example"><parameter name="k">v</parameter>'
+            "</invoke> in prose."
+        )
+        assert f.feed(text) + f.finish() == text
+
+    def test_stream_filter_inert_for_bare_invoke_without_tools(self):
+        for tools in (None, []):
+            f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+            text = f"Prose {self.BARE_CALL} end."
+            assert f.feed(text) + f.finish() == text
+
+
+class TestUndeclaredThinkingCallWarns:
+    """Dropped thinking-channel calls must not vanish silently (#4933)."""
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    def test_undeclared_thinking_call_emits_warning(self, caplog):
+        thinking = (
+            "Let me read it.\n"
+            '<function=Read><parameter=path>/tmp/a.log</parameter></function>'
+        )
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = extract_tool_calls_with_thinking(
+                thinking, "", MagicMock(spec=[]), self.TOOLS
+            )
+        assert result.tool_calls is None
+        assert any(
+            "not declared in this request" in r.message for r in caplog.records
+        )
+
+    def test_declared_thinking_call_does_not_warn(self, caplog):
+        thinking = '<tool_call>{"name": "read", "arguments": {"path": "/x"}}</tool_call>'
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = extract_tool_calls_with_thinking(
+                thinking, "", MagicMock(spec=[]), self.TOOLS
+            )
+        assert result.tool_calls is not None
+        assert not any(
+            "not declared in this request" in r.message for r in caplog.records
+        )
