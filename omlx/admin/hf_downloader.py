@@ -16,6 +16,7 @@ import glob
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -726,6 +727,32 @@ def _is_local_copy(path: Path, size: int) -> bool:
         return False
 
 
+def _checkpoint_folder(name: str) -> str:
+    """Top-level folder holding the checkpoint `name` belongs to ('' = repo root)."""
+    return name.split("/", 1)[0] if "/" in name else ""
+
+
+# `2-bit`, `4bit`, `6.0-bit`: the same checkpoint published at another precision.
+_PRECISION_FOLDER_RE = re.compile(r"^\d+(?:\.\d+)?(?:-|_)?bit$", re.IGNORECASE)
+
+
+def _default_safetensors_checkpoint(names: list[str]) -> str | None:
+    """Checkpoint a safetensors repo loads by default; None when ambiguous.
+
+    Multi-precision repos keep `2-bit/`, `4-bit/`, ... next to the root copy
+    the repo serves by default; a lone weight folder is equally unambiguous.
+    Anything else stays whole-repo (#4932).
+    """
+    folders = {
+        _checkpoint_folder(name) for name in names if name.endswith(".safetensors")
+    }
+    if "" in folders:
+        return ""
+    if len(folders) == 1:
+        return folders.pop()
+    return None
+
+
 def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
     """Add download hints to model-info file rows; return the repo layout.
 
@@ -735,9 +762,27 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
     layout = _repo_layout(names)
     split_groups = gguf.split_file_groups(names)
     projectors = _default_mmproj(names)
+    checkpoint = (
+        _default_safetensors_checkpoint(names) if layout == "safetensors" else None
+    )
+
+    def other_precision(name: str) -> bool:
+        folder = _checkpoint_folder(name)
+        return (
+            checkpoint is not None
+            and folder != checkpoint
+            and _PRECISION_FOLDER_RE.match(folder) is not None
+        )
+
     # A selection starts from what downloading the whole repo would fetch.
     preselected = (
-        set(filter_repo_objects(names, ignore_patterns=_SAFETENSORS_REPO_IGNORE))
+        {
+            name
+            for name in filter_repo_objects(
+                names, ignore_patterns=_SAFETENSORS_REPO_IGNORE
+            )
+            if not other_precision(name)
+        }
         if layout == "safetensors"
         else set()
     )
@@ -757,7 +802,9 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
         else:
             row["kind"] = "other"
         optional = _optional_for_safetensors(name)
-        row["required"] = layout == "safetensors" and not optional
+        row["required"] = (
+            layout == "safetensors" and not optional and not other_precision(name)
+        )
         row["preselected"] = name in preselected
         row["local"] = local_dir is not None and _is_local_copy(
             local_dir / name, row["size"]
