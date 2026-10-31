@@ -5406,7 +5406,9 @@ async def create_chat_completion(
                 if recovered is not None:
                     cleaned_text = recovered
                 elif failure := _tool_call_failure(
-                    extraction, withheld_payload=withheld_payload
+                    extraction,
+                    withheld_payload=withheld_payload,
+                    finish_reason=output.finish_reason,
                 ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
@@ -5430,7 +5432,12 @@ async def create_chat_completion(
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
-            finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            # A length stop can cut a later call, so it wins over tool_calls.
+            finish_reason = (
+                "tool_calls"
+                if tool_calls and output.finish_reason != "length"
+                else output.finish_reason
+            )
             reasoning_token_count = (
                 len(engine.tokenizer.encode(cleaned_thinking))
                 if cleaned_thinking
@@ -6349,8 +6356,12 @@ def _tool_call_failure(
     extraction: ToolCallExtraction | None = None,
     *,
     withheld_payload: bool = False,
+    finish_reason: str | None = None,
 ) -> dict | None:
     failed = () if extraction is None else extraction.parse_errors
+    if finish_reason == "length":
+        # The length finish reports a call cut by the token limit.
+        failed = tuple(error for error in failed if error != "incomplete")
     has_calls = bool(extraction and extraction.tool_calls)
     if "incomplete" in failed or (withheld_payload and not has_calls):
         code = "incomplete_tool_call"
@@ -6981,7 +6992,10 @@ async def stream_chat_completion(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction,
+            finish_reason=last_output.finish_reason if last_output else "stop",
+        )
         cleaned_thinking = extraction.cleaned_thinking
         # Process response_format if specified
         if request.response_format and not tool_calls:
@@ -7147,10 +7161,10 @@ async def stream_chat_completion(
         return
 
     # Final chunk with finish_reason
+    output_finish = last_output.finish_reason if last_output else "stop"
+    # A length stop can cut a later call, so it wins over tool_calls.
     finish_reason = (
-        "tool_calls"
-        if tool_calls
-        else (last_output.finish_reason if last_output else "stop")
+        "tool_calls" if tool_calls and output_finish != "length" else output_finish
     )
     final_chunk = ChatCompletionChunk(
         id=response_id,
@@ -7596,7 +7610,10 @@ async def stream_anthropic_messages(
         )
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction,
+            finish_reason=last_output.finish_reason if last_output else "stop",
+        )
 
     recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
         tool_filter,
@@ -8186,7 +8203,9 @@ async def create_anthropic_message(
                 if recovered is not None:
                     cleaned_text = recovered
                 elif failure := _tool_call_failure(
-                    extraction, withheld_payload=withheld_payload
+                    extraction,
+                    withheld_payload=withheld_payload,
+                    finish_reason=output.finish_reason,
                 ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
@@ -8942,7 +8961,9 @@ async def create_response(
                 if recovered is not None:
                     cleaned_text = recovered
                 elif failure := _tool_call_failure(
-                    extraction, withheld_payload=withheld_payload
+                    extraction,
+                    withheld_payload=withheld_payload,
+                    finish_reason=output.finish_reason,
                 ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
@@ -9494,7 +9515,10 @@ async def stream_responses_api(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         parse_errors = extraction.parse_errors
-        tool_failure = _tool_call_failure(extraction)
+        tool_failure = _tool_call_failure(
+            extraction,
+            finish_reason=last_output.finish_reason if last_output else "stop",
+        )
         if not stream_content:
             cleaned_thinking = (extraction.cleaned_thinking or "").strip()
             for ev in _emit_reasoning_delta(cleaned_thinking):
