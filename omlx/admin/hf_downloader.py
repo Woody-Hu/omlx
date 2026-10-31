@@ -774,7 +774,8 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
             and _PRECISION_FOLDER_RE.match(folder) is not None
         )
 
-    # A selection starts from what downloading the whole repo would fetch.
+    # A selection starts from what a whole-repo download fetches, minus
+    # other precisions of the default checkpoint.
     preselected = (
         {
             name
@@ -1499,9 +1500,15 @@ class HFDownloader(_QueuePersistenceMixin):
             params_formatted = _format_param_count(params) if params > 0 else None
             if size == 0 and "U32" not in st_params:
                 size = _calc_safetensors_disk_size({"parameters": st_params})
-        # What "download all" fetches, by the rules of a whole-repo download.
-        download_all_size = _sum_snapshot_bytes(
-            info.siblings, _SAFETENSORS_REPO_IGNORE if st_params else None
+        # What "download all" still fetches: a whole-repo download minus local files.
+        download_all_size = sum(
+            row["size"]
+            for row in filter_repo_objects(
+                files,
+                ignore_patterns=_SAFETENSORS_REPO_IGNORE if st_params else None,
+                key=lambda row: row["name"],
+            )
+            if not row["local"]
         )
 
         # Fetch model card (README.md) content

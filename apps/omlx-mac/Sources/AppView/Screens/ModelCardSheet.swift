@@ -597,12 +597,7 @@ struct ModelCardSheet: View {
         let picked = selectedFiles(dto)
         let pickedSize = picked.reduce(Int64(0)) { $0 + $1.size }
         // What "Download All" still fetches: its files not downloaded yet.
-        let files = dto.files ?? []
-        let allSize = files.isEmpty
-            ? (dto.downloadAllSize ?? 0)
-            : files
-                .filter { (dto.layout != "safetensors" || $0.preselected == true) && $0.local != true }
-                .reduce(Int64(0)) { $0 + $1.size }
+        let allSize = dto.downloadAllSize ?? 0
         if !fitsDisk(pickedSize, dto) {
             Text(String(localized: "downloads.card.not_enough_space",
                         defaultValue: "Not enough free space in the model folder",

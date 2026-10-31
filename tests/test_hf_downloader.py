@@ -5214,6 +5214,33 @@ class TestFileSelection:
                 if name.startswith(folder) and rows[name]["preselected"]
             ]
 
+    @pytest.mark.asyncio
+    async def test_download_all_size_counts_every_precision_folder(self, tmp_path):
+        sizes = {
+            "config.json": 1,
+            "model.safetensors": 100,
+            "pytorch_model.bin": 1000,
+            "4-bit/config.json": 1,
+            "4-bit/model.safetensors": 50,
+            "8-bit/config.json": 1,
+            "8-bit/model.safetensors": 200,
+        }
+        (tmp_path / "config.json").write_bytes(b"x")
+        info = MagicMock()
+        info.safetensors = {"parameters": {"BF16": 100}, "total": 100}
+        info.siblings = [_sibling(name, size) for name, size in sizes.items()]
+
+        with (
+            patch("omlx.admin.hf_downloader.HfApi") as api_cls,
+            patch("omlx.admin.hf_downloader.hf_hub_download", side_effect=Exception()),
+        ):
+            api_cls.return_value.model_info.return_value = info
+            result = await HFDownloader.get_model_info("org/m", local_dir=tmp_path)
+
+        # Download All fetches the whole repo, not only the preselected
+        # checkpoint; the local config.json and the .bin copy are not fetched.
+        assert result["download_all_size"] == 100 + 51 + 201
+
     def test_lone_precision_folder_still_locks_its_files(self):
         files = [
             {"name": name, "size": 1}
